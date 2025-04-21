@@ -2,12 +2,11 @@ import torch
 import torch.nn as nn
 from torch.nn import init
 
-from CBAM import CBAM
 from CLFR import CLFR
 from resnet import resnet50, resnet18
 import torch.nn.functional as F
 from CLFO import CLFO
-
+from MDFO import MDFO
 
 # 将CLFO加在DEE块后
 
@@ -133,122 +132,6 @@ class DEE_module(nn.Module):
         return out
 
 
-class CNL(nn.Module):
-    def __init__(self, high_dim, low_dim, flag=0):
-        super(CNL, self).__init__()
-        self.high_dim = high_dim
-        self.low_dim = low_dim
-
-        self.g = nn.Conv2d(self.low_dim, self.low_dim, kernel_size=1, stride=1, padding=0)
-        self.theta = nn.Conv2d(self.high_dim, self.low_dim, kernel_size=1, stride=1, padding=0)
-        if flag == 0:
-            self.phi = nn.Conv2d(self.low_dim, self.low_dim, kernel_size=1, stride=1, padding=0)
-            self.W = nn.Sequential(nn.Conv2d(self.low_dim, self.high_dim, kernel_size=1, stride=1, padding=0),
-                                   nn.BatchNorm2d(high_dim), )
-        else:
-            self.phi = nn.Conv2d(self.low_dim, self.low_dim, kernel_size=1, stride=2, padding=0)
-            self.W = nn.Sequential(nn.Conv2d(self.low_dim, self.high_dim, kernel_size=1, stride=2, padding=0),
-                                   nn.BatchNorm2d(self.high_dim), )
-        nn.init.constant_(self.W[1].weight, 0.0)
-        nn.init.constant_(self.W[1].bias, 0.0)
-
-    def forward(self, x_h, x_l):
-        B = x_h.size(0)
-        g_x = self.g(x_l).view(B, self.low_dim, -1)
-
-        theta_x = self.theta(x_h).view(B, self.low_dim, -1)
-        phi_x = self.phi(x_l).view(B, self.low_dim, -1).permute(0, 2, 1)
-
-        energy = torch.matmul(theta_x, phi_x)
-        attention = energy / energy.size(-1)
-
-        y = torch.matmul(attention, g_x)
-        y = y.view(B, self.low_dim, *x_l.size()[2:])
-        W_y = self.W(y)
-        z = W_y + x_h
-
-        return z
-
-
-class PNL(nn.Module):
-    def __init__(self, high_dim, low_dim, reduc_ratio=2):
-        super(PNL, self).__init__()
-        self.high_dim = high_dim
-        self.low_dim = low_dim
-        self.reduc_ratio = reduc_ratio
-
-        self.g = nn.Conv2d(self.low_dim, self.low_dim // self.reduc_ratio, kernel_size=1, stride=1, padding=0)
-        self.theta = nn.Conv2d(self.high_dim, self.low_dim // self.reduc_ratio, kernel_size=1, stride=1, padding=0)
-        self.phi = nn.Conv2d(self.low_dim, self.low_dim // self.reduc_ratio, kernel_size=1, stride=1, padding=0)
-
-        self.W = nn.Sequential(
-            nn.Conv2d(self.low_dim // self.reduc_ratio, self.high_dim, kernel_size=1, stride=1, padding=0),
-            nn.BatchNorm2d(high_dim), )
-        nn.init.constant_(self.W[1].weight, 0.0)
-        nn.init.constant_(self.W[1].bias, 0.0)
-
-    def forward(self, x_h, x_l):
-        B = x_h.size(0)
-        g_x = self.g(x_l).reshape(B, self.low_dim, -1)
-        g_x = g_x.permute(0, 2, 1)
-
-        theta_x = self.theta(x_h).reshape(B, self.low_dim, -1)
-        theta_x = theta_x.permute(0, 2, 1)
-
-        phi_x = self.phi(x_l).reshape(B, self.low_dim, -1)
-
-        energy = torch.matmul(theta_x, phi_x)
-        attention = energy / energy.size(-1)
-
-        y = torch.matmul(attention, g_x)
-        y = y.permute(0, 2, 1).contiguous()
-        y = y.reshape(B, self.low_dim // self.reduc_ratio, *x_h.size()[2:])
-        W_y = self.W(y)
-        z = W_y + x_h
-        return z
-
-class SpatialAttention(nn.Module):
-    def __init__(self, in_channels):
-        super(SpatialAttention, self).__init__()
-        self.conv = nn.Conv2d(in_channels, 1, kernel_size=7, padding=3)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        sa = self.conv(x)
-        sa = self.sigmoid(sa)
-        return sa
-
-
-class TokenAttention(nn.Module):
-    def __init__(self, in_channels):
-        super(TokenAttention, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        ta = self.conv1(x)
-        ta = self.relu(ta)
-        ta = self.conv2(ta)
-        ta = self.sigmoid(ta)
-        return ta
-
-class MFA_block(nn.Module):
-    def __init__(self, high_dim, low_dim, flag):
-        super(MFA_block, self).__init__()
-        self.CNL = CNL(high_dim, low_dim, flag)
-        self.PNL = PNL(high_dim, low_dim)
-        self.cbam = CBAM(high_dim)
-
-    def forward(self, x, x0):
-        z = self.CNL(x, x0)
-        z = self.PNL(z, x0)
-        z = self.cbam(z)  # 应用CBAM模块
-
-        return z
-
-
 class embed_net(nn.Module):
     def __init__(self, class_num, dataset, arch='resnet50'):
         super(embed_net, self).__init__()
@@ -261,14 +144,14 @@ class embed_net(nn.Module):
         if self.dataset == 'regdb':  # For regdb dataset, we remove the MFA3 block and layer4.
             pool_dim = 1024
             self.DEE = DEE_module(512)
-            self.MFA1 = MFA_block(256, 64, 0)
-            self.MFA2 = MFA_block(512, 256, 1)
+            self.MDFO1 = MDFO(256, 64, 0)
+            self.MDFO2 = MDFO(512, 256, 1)
         else:
             pool_dim = 2048
             self.DEE = DEE_module(1024)
-            self.MFA1 = MFA_block(256, 64, 0)
-            self.MFA2 = MFA_block(512, 256, 1)
-            self.MFA3 = MFA_block(1024, 512, 1)
+            self.MDFO1 = MDFO(256, 64, 0)
+            self.MDFO2 = MDFO(512, 256, 1)
+            self.MDFO3 = MDFO(1024, 512, 1)
 
         self.bottleneck = nn.BatchNorm1d(pool_dim)
         self.bottleneck.bias.requires_grad_(False)  # no shift
@@ -291,10 +174,10 @@ class embed_net(nn.Module):
 
         x_ = x
         x = self.base_resnet.base.layer1(x_)
-        x_ = self.MFA1(x, x_)
+        x_ = self.MDFO1(x, x_)
 
         x = self.base_resnet.base.layer2(x_)
-        x_ = self.MFA2(x, x_)
+        x_ = self.MDFO2(x, x_)
 
         if self.dataset == 'regdb':
             x_ = self.DEE(x_)
@@ -305,7 +188,7 @@ class embed_net(nn.Module):
 
         else:
             x = self.base_resnet.base.layer3(x_)
-            x_ = self.MFA3(x, x_)
+            x_ = self.MDFO3(x, x_)
 
             x_ = self.DEE(x_)
             x_ = self.clfo(x_)  # 应用 CLFO 模块
